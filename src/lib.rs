@@ -97,7 +97,7 @@ where
                 .app_api
                 .send_authorized(self.app_api.0.client.get(url))
                 .await?;
-            let r = self.app_api.parse::<T>(r, parse_json).await?;
+            let r = parse_response_json::<T>(r).await?;
             self.next_url = r.next_url();
             Ok(Some(r))
         } else {
@@ -304,10 +304,7 @@ impl AppApi {
             .await
             .context(error::Http)?;
 
-        let r = self
-            .parse::<auth::Response>(resp, parse_json)
-            .await?
-            .response;
+        let r = parse_response_json::<auth::Response>(resp).await?.response;
 
         auth.refresh_token = Some(r.refresh_token.clone());
         auth.access_token = Some(r.access_token.clone());
@@ -337,24 +334,6 @@ impl AppApi {
         );
 
         request.headers(headers).send().await.context(error::Http)
-    }
-
-    async fn parse<T>(
-        &self,
-        response: reqwest::Response,
-        callback: impl FnOnce(&[u8]) -> Result<T>,
-    ) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        let status = response.status();
-        if status.is_success() {
-            let body = response.bytes().await.context(error::Http)?;
-            callback(&body)
-        } else {
-            let text = response.text().await.context(error::Http)?;
-            error::UnexpectedStatus { status, text }.fail()
-        }
     }
 
     pub fn illust_bookmarks(&self, user_id: &str, private: bool) -> Pager<illust::Response> {
@@ -402,7 +381,7 @@ impl AppApi {
     }
 
     pub async fn user_detail(&self, user_id: &str) -> Result<user::Response> {
-        self.parse(
+        parse_response_json(
             self.send_authorized(
                 self.0
                     .client
@@ -410,7 +389,6 @@ impl AppApi {
                     .query(&[("user_id", user_id)]),
             )
             .await?,
-            parse_json,
         )
         .await
     }
@@ -432,7 +410,7 @@ impl AppApi {
                     .query(&query),
             )
             .await?;
-        self.parse(resp, parse_json).await
+        parse_response_json(resp).await
     }
 
     pub async fn webview_novel(&self, novel_id: &str) -> Result<novel::WebViewNovelResponse> {
@@ -445,23 +423,20 @@ impl AppApi {
             )
             .await?;
 
-        self.parse(resp, |bytes| {
-            let re = Regex::new(r#"novel:\s*(\{.+\}),\s+isOwnWork"#).unwrap();
-            let text = String::from_utf8_lossy(&bytes);
-            let caps = re
-                .captures(&text)
-                .ok_or_else(|| Error::ExtractJsonFromHtml {
-                    text: text.to_string(),
-                })?;
+        let text = get_response_text(resp).await?;
+        let re = Regex::new(r#"novel:\s*(\{.+\}),\s+isOwnWork"#).unwrap();
+        let caps = re
+            .captures(&text)
+            .ok_or_else(|| Error::ExtractJsonFromHtml {
+                text: text.to_string(),
+            })?;
 
-            let json_str = &caps[1];
-            parse_json(json_str.as_bytes())
-        })
-        .await
+        let json_str = &caps[1];
+        parse_json(json_str)
     }
 
     pub async fn novel_text<'a>(&self, novel_id: &str) -> Result<novel::NovelTextResponse> {
-        self.parse(
+        parse_response_json(
             self.send_authorized(
                 self.0
                     .client
@@ -469,13 +444,12 @@ impl AppApi {
                     .query(&[("novel_id", novel_id)]),
             )
             .await?,
-            parse_json,
         )
         .await
     }
 
     pub async fn ugoira_metadata<'a>(&self, illust_id: &str) -> Result<illust::UgoiraResponse> {
-        self.parse(
+        parse_response_json(
             self.send_authorized(
                 self.0
                     .client
@@ -483,12 +457,27 @@ impl AppApi {
                     .query(&[("illust_id", illust_id)]),
             )
             .await?,
-            parse_json,
         )
         .await
     }
 }
 
-fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
-    serde_json::from_slice(body).context(error::UnexpectedJson)
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T> {
+    serde_json::from_str(text).context(error::UnexpectedJson)
+}
+
+async fn get_response_text(response: reqwest::Response) -> Result<String> {
+    let status = response.status();
+    if status.is_success() {
+        let body = response.text().await.context(error::Http)?;
+        Ok(body)
+    } else {
+        let text = response.text().await.context(error::Http)?;
+        error::UnexpectedStatus { status, text }.fail()
+    }
+}
+
+async fn parse_response_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+    let body = get_response_text(response).await?;
+    parse_json(&body)
 }
